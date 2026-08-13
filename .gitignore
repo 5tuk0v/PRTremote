@@ -1,0 +1,21 @@
+# --- harvested credentials / tool output -- NEVER commit these ---
+prt_cookie_*.txt
+tokens_*.json
+k.txt
+cookie*.txt
+*.dat
+.roadtools_auth
+authorize_response.html
+
+# --- python venv ---
+bin/
+include/
+lib/
+lib64
+share/
+pyvenv.cfg
+
+# --- caches / local config ---
+__pycache__/
+*.pyc
+.claude/
