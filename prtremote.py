@@ -265,9 +265,12 @@ class JoinStateProbe:
     # Remote Registry service management (best-effort start/restore)
     # ------------------------------------------------------------------ #
     def _open_scm(self):
-        rpc = transport.SMBTransport(
-            self.smb.getRemoteHost(), filename=r"\svcctl", smb_connection=self.smb
-        )
+        # Match Impacket's own reg.py transport setup.  In particular, include
+        # ``\pipe`` in the binding instead of relying on SMBTransport's filename
+        # normalization, which differs between Impacket releases.
+        binding = r"ncacn_np:%s[\pipe\svcctl]" % self.smb.getRemoteHost()
+        rpc = transport.DCERPCTransportFactory(binding)
+        rpc.set_smb_connection(self.smb)
         dce = rpc.get_dce_rpc()
         dce.connect()
         dce.bind(scmr.MSRPC_UUID_SCMR)
@@ -276,12 +279,26 @@ class JoinStateProbe:
     def ensure_remote_registry(self):
         """Start the RemoteRegistry service if stopped. Returns a callable that
         stops it again afterwards, or None if it was already running / nothing to
-        restore. Every step is best-effort and non-fatal: if we can't manage the
+        restore. If the service was disabled, its original startup type is restored
+        as well. Every step is best-effort and non-fatal: if we can't manage the
         service, we simply proceed and let the \\winreg open surface a clear error."""
+        original_start_type = None
+        changed_start_type = False
+        started_by_us = False
+
+        def wait_for_state(dce, svc, wanted, timeout=10):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                state = scmr.hRQueryServiceStatus(dce, svc)["lpServiceStatus"]["dwCurrentState"]
+                if state == wanted:
+                    return True
+                time.sleep(0.25)
+            return False
+
         try:
             dce = self._open_scm()
         except Exception as e:
-            logging.debug("Could not open SCM to check RemoteRegistry: %s", e)
+            logging.warning("Could not open SCM to manage RemoteRegistry: %s", e)
             return None
 
         try:
@@ -289,40 +306,84 @@ class JoinStateProbe:
             svc = scmr.hROpenServiceW(dce, scm, "RemoteRegistry\x00")["lpServiceHandle"]
 
             # Already running? Leave it alone (don't stop a service we didn't start).
-            was_running = False
             try:
                 state = scmr.hRQueryServiceStatus(dce, svc)["lpServiceStatus"]["dwCurrentState"]
-                was_running = (state == scmr.SERVICE_RUNNING)
             except Exception as e:
-                logging.debug("QueryServiceStatus failed (%s); will try to start anyway", e)
-            if was_running:
+                logging.warning("Could not query RemoteRegistry status: %s", e)
+                return None
+            if state == scmr.SERVICE_RUNNING:
                 logging.debug("RemoteRegistry already running")
                 return None
+            if state != scmr.SERVICE_STOPPED:
+                logging.debug("RemoteRegistry is in state %s; leaving it unchanged", state)
+                return None
 
-            # Make sure it isn't disabled, then start it. Both are best-effort.
+            # Record the startup type before changing it so a disabled service can
+            # be put back exactly as it was after the registry reads finish.
             try:
-                scmr.hRChangeServiceConfigW(
-                    dce, svc, scmr.SERVICE_NO_CHANGE, scmr.SERVICE_DEMAND_START,
-                    scmr.SERVICE_NO_CHANGE, "\x00", None, 0, "\x00", None, 0, "\x00",
-                )
+                config = scmr.hRQueryServiceConfigW(dce, svc)["lpServiceConfig"]
+                original_start_type = config["dwStartType"]
             except Exception as e:
-                logging.debug("ChangeServiceConfig failed (%s); continuing", e)
+                logging.warning("Could not query RemoteRegistry configuration: %s", e)
+                return None
+
+            if original_start_type == scmr.SERVICE_DISABLED:
+                try:
+                    scmr.hRChangeServiceConfigW(
+                        dce, svc, dwStartType=scmr.SERVICE_DEMAND_START
+                    )
+                    changed_start_type = True
+                except Exception as e:
+                    logging.warning("Could not enable RemoteRegistry temporarily: %s", e)
+                    return None
+
             try:
                 scmr.hRStartServiceW(dce, svc)
-                logging.info("Started RemoteRegistry (will stop it again afterwards)")
+                started_by_us = True
             except Exception as e:
-                logging.debug("StartService returned (%s); may already be starting", e)
+                logging.warning("Could not start RemoteRegistry: %s", e)
+                if changed_start_type:
+                    scmr.hRChangeServiceConfigW(
+                        dce, svc, dwStartType=original_start_type
+                    )
+                return None
+
+            reached_running = wait_for_state(dce, svc, scmr.SERVICE_RUNNING)
+            if not reached_running:
+                logging.warning("RemoteRegistry did not reach the running state")
+            else:
+                logging.info("Started RemoteRegistry (will restore its prior state afterwards)")
 
             def restore():
+                d = None
                 try:
                     d = self._open_scm()
                     s = scmr.hROpenSCManagerW(d)["lpScHandle"]
                     h = scmr.hROpenServiceW(d, s, "RemoteRegistry\x00")["lpServiceHandle"]
-                    scmr.hRControlService(d, h, scmr.SERVICE_CONTROL_STOP)
-                    d.disconnect()
-                    logging.debug("Stopped RemoteRegistry")
+                    if started_by_us:
+                        try:
+                            scmr.hRControlService(d, h, scmr.SERVICE_CONTROL_STOP)
+                            if not wait_for_state(d, h, scmr.SERVICE_STOPPED):
+                                logging.warning("RemoteRegistry did not stop within 10 seconds")
+                        except Exception as e:
+                            logging.warning("Could not stop RemoteRegistry: %s", e)
+                    if changed_start_type:
+                        try:
+                            scmr.hRChangeServiceConfigW(
+                                d, h, dwStartType=original_start_type
+                            )
+                        except Exception as e:
+                            logging.warning(
+                                "Could not restore RemoteRegistry startup type: %s", e
+                            )
+                    logging.debug("Restored RemoteRegistry service state")
                 except Exception as e:
-                    logging.debug("Failed to stop RemoteRegistry: %s", e)
+                    logging.warning("Failed to restore RemoteRegistry service state: %s", e)
+                finally:
+                    try:
+                        d.disconnect()
+                    except Exception:
+                        pass
 
             return restore
         except Exception as e:
