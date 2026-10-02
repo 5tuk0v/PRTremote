@@ -22,8 +22,8 @@ prtremote -- remote PRT SSO cookie tooling for Entra/hybrid-joined Windows hosts
 check and dump need local admin. For authorized security assessment of systems
 you own or are permitted to test.
 
-    python3 prtremote.py check ENDPOINT/labadmin:Passw0rd!@win11
-    python3 prtremote.py dump  ENDPOINT/labadmin:Passw0rd!@win11 -run-user achen
+    python3 prtremote.py check ENDPOINT/labadmin:"$PASSWORD"@win11
+    python3 prtremote.py dump  ENDPOINT/labadmin:"$PASSWORD"@win11 -run-user achen
     python3 prtremote.py auth  --prt prt_cookie_win11_achen.txt --graph
 """
 
@@ -34,6 +34,7 @@ import io
 import json
 import logging
 import os
+import shlex
 import struct
 import sys
 import time
@@ -556,9 +557,17 @@ def run_check(options, domain, username, password, remoteName):
 
     if azure_ad and loaded:
         candidates = [name or sid for sid, name in loaded]
+        # Never reuse options.target here: it is the raw CLI argument and may
+        # contain a plaintext password.  Emit a literal shell-variable reference
+        # instead, so copying the command uses $PASSWORD without disclosing it.
+        # If the variable is unset, the existing getpass() fallback still applies.
+        account = ('%s/' % domain if domain else '') + username
+        safe_target = ('%s:"$PASSWORD"@%s'
+                       % (shlex.quote(account), shlex.quote(remoteName))
+                       if account else shlex.quote(remoteName))
         print('')
         say('Harvest with: prtremote.py dump %s -run-user %s'
-            % (options.target, candidates[0]))
+            % (safe_target, shlex.quote(candidates[0])))
         if len(candidates) > 1:
             say('Other candidates: %s' % ', '.join(candidates[1:]))
     elif not azure_ad:
@@ -1094,8 +1103,8 @@ def build_parser():
         description='Remote PRT SSO cookie tooling for Entra/hybrid-joined Windows '
                     'hosts. Authorized security testing only.',
         epilog="examples:\n"
-               "  prtremote.py check ENDPOINT/labadmin:'Passw0rd!'@win11\n"
-               "  prtremote.py dump  ENDPOINT/labadmin:'Passw0rd!'@win11 -run-user achen\n"
+               "  prtremote.py check ENDPOINT/labadmin:\"$PASSWORD\"@win11\n"
+               "  prtremote.py dump  ENDPOINT/labadmin:\"$PASSWORD\"@win11 -run-user achen\n"
                "  prtremote.py auth  --prt prt_cookie_win11_achen.txt --graph\n")
     sub = parser.add_subparsers(dest='mode', metavar='{check,dump,auth}')
 
