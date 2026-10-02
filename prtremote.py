@@ -30,10 +30,12 @@ you own or are permitted to test.
 import argparse
 import base64
 import datetime
+import html
 import io
 import json
 import logging
 import os
+import re
 import shlex
 import struct
 import sys
@@ -946,20 +948,38 @@ def describe_authorize_failure(res, location):
         return ('Entra returned a fresh nonce instead of a code, so the cookie was '
                 'already stale -- harvest a new one and redeem it right away')
 
-    # Entra puts the real error in a $Config= JSON blob in the error page. Trim
-    # back from the script terminator rather than by a fixed offset, so a change
-    # in their whitespace doesn't cost us the message.
-    start, stop = res.content.find(b'$Config='), res.content.find(b'//]]>')
-    if start != -1 and stop != -1:
+    # Entra commonly puts the real error in a $Config JSON object. Decode one
+    # JSON value rather than depending on a particular script terminator, which
+    # has changed across login-page versions.
+    body = res.text
+    marker = body.find('$Config=')
+    if marker != -1:
         try:
-            cfg = json.loads(res.content[start + 8:stop].strip().rstrip(b';'))
-        except ValueError:
+            cfg, _ = json.JSONDecoder().raw_decode(body[marker + 8:].lstrip())
+        except (TypeError, ValueError):
             cfg = {}
         detail = ' '.join(str(cfg[k]) for k in ('sErrorCode', 'strMainMessage',
                                                 'strServiceExceptionMessage')
                           if cfg.get(k))
         if detail:
             return 'Entra refused the cookie: %s' % detail
+
+    # Some newer pages render the error directly into HTML instead. Return only
+    # the compact AADSTS message, never the full page (which may contain state).
+    plain = html.unescape(re.sub(r'<[^>]+>', ' ', body))
+    plain = re.sub(r'\s+', ' ', plain).strip()
+    aadsts = re.search(r'(AADSTS\d+[^\r\n<]{0,500})', plain, re.IGNORECASE)
+    if aadsts:
+        return 'Entra refused the cookie: %s' % aadsts.group(1).strip()
+
+    title = re.search(r'<title[^>]*>(.*?)</title>', body,
+                      re.IGNORECASE | re.DOTALL)
+    if title:
+        title_text = re.sub(r'\s+', ' ', html.unescape(title.group(1))).strip()
+        if title_text:
+            return ('Entra returned an interactive page instead of a code: %s '
+                    '(the cookie may be stale, or MFA/Conditional Access may be required)'
+                    % title_text)
     return 'unexpected reply from /authorize (HTTP %d)' % res.status_code
 
 
@@ -971,6 +991,10 @@ def redeem_prt_cookie(cookie, resource):
     if 'request_nonce' not in claims:
         raise RuntimeError('the cookie has no request_nonce claim -- either it is '
                            'not a PRT SSO cookie, or it needs a session key')
+    now = int(time.time())
+    if claims.get('exp') is not None and int(claims['exp']) <= now:
+        raise RuntimeError('the PRT SSO cookie has expired -- harvest a new one and '
+                           'redeem it immediately (normally within about 5 minutes)')
 
     params = {
         'client_id': AUTH_CLIENT,
